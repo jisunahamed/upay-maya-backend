@@ -5,8 +5,10 @@ Do not add financial-data endpoints without authentication and call-specific
 identity verification enforced in backend code.
 """
 
-import os
 import logging
+import os
+import socket
+import ssl
 
 import httpx
 from fastapi import FastAPI
@@ -34,23 +36,19 @@ def health():
 
 
 def _build_supabase_headers(key: str) -> dict[str, str]:
-    """Build correct Supabase headers for both legacy and new key formats.
+    """Build Data API headers without treating opaque API keys as JWTs.
 
-    - Legacy service-role JWT keys: use 'apikey' header
-    - New secret keys (sb_secret_*): use 'Authorization: Bearer' header
-    Both formats also accept the 'apikey' header for backwards compatibility,
-    but new keys work more reliably with Authorization header.
+    Supabase's new ``sb_secret_`` keys belong only in ``apikey``. Legacy
+    JWT-based service-role keys are also sent as bearer tokens so PostgREST can
+    assume the embedded role.
     """
-    headers = {"Accept": "application/json"}
-    # Support both key formats: use Authorization for sb_secret_ keys,
-    # apikey for legacy JWT keys. Include both for maximum compatibility.
-    if key.startswith("sb_secret_"):
+    headers = {"Accept": "application/json", "apikey": key}
+    if key.count(".") == 2 and key.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {key}"
-    headers["apikey"] = key
     return headers
 
 
-def _categorize_error(exc: Exception, response: httpx.Response | None = None) -> str:
+def _categorize_error(exc: Exception | None = None, response: httpx.Response | None = None) -> str:
     """Categorize error for safe diagnostic logging (no secrets)."""
     if response is not None:
         if response.status_code == 401:
@@ -66,13 +64,24 @@ def _categorize_error(exc: Exception, response: httpx.Response | None = None) ->
         return "connect_timeout"
     if isinstance(exc, httpx.ReadTimeout):
         return "read_timeout"
+    cause = exc
+    while cause is not None:
+        if isinstance(cause, socket.gaierror):
+            return "dns_error"
+        if isinstance(cause, ssl.SSLError):
+            return "tls_error"
+        cause = cause.__cause__
     if isinstance(exc, httpx.ConnectError):
         return "connection_error"
-    if isinstance(exc, httpx.DNSError):
-        return "dns_error"
+    if isinstance(exc, httpx.RemoteProtocolError):
+        return "invalid_http_response"
     if isinstance(exc, httpx.HTTPError):
         return "http_error"
-    return type(exc).__name__
+    return type(exc).__name__ if exc is not None else "unknown_error"
+
+
+def _has_wrapping_quotes(value: str) -> bool:
+    return len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}
 
 
 @app.get("/health/db")
@@ -82,18 +91,28 @@ async def database_health():
     Intentionally returns no customer data, credentials, URLs or raw errors.
     This is a connectivity check, not an authorization or identity test.
     """
-    url = os.getenv("SUPABASE_URL", "").strip().rstrip("/")
-    key = os.getenv("SUPABASE_SECRET_KEY", "").strip()
+    raw_url = os.getenv("SUPABASE_URL", "")
+    raw_key = os.getenv("SUPABASE_SECRET_KEY", "")
+    url = raw_url.strip().rstrip("/")
+    key = raw_key.strip()
     if not url or not key:
-        logger.warning("Supabase health check: missing environment variables")
+        logger.warning("operation=supabase_health category=missing_configuration")
         return JSONResponse(status_code=503, content={"database": "not_configured"})
-    if not url.startswith("https://") or not url.endswith(".supabase.co"):
-        logger.warning("Supabase health check: invalid URL format")
+    if (
+        raw_url != raw_url.strip()
+        or raw_key != raw_key.strip()
+        or _has_wrapping_quotes(url)
+        or _has_wrapping_quotes(key)
+        or not url.startswith("https://")
+        or not url.endswith(".supabase.co")
+    ):
+        logger.warning("operation=supabase_health category=invalid_configuration")
         return JSONResponse(status_code=503, content={"database": "invalid_configuration"})
 
     headers = _build_supabase_headers(key)
     try:
-        async with httpx.AsyncClient(timeout=8.0, follow_redirects=False) as client:
+        timeout = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
+        async with httpx.AsyncClient(timeout=timeout, follow_redirects=False) as client:
             response = await client.get(
                 f"{url}/rest/v1/customers",
                 params={"select": "customer_id", "limit": "1"},
@@ -101,13 +120,27 @@ async def database_health():
             )
     except httpx.HTTPError as exc:
         error_category = _categorize_error(exc)
-        logger.warning("Supabase health check failed: %s", error_category)
+        logger.warning(
+            "operation=supabase_health category=%s exception=%s",
+            error_category,
+            type(exc).__name__,
+        )
         return JSONResponse(status_code=503, content={"database": "unreachable"})
+    except Exception as exc:
+        logger.warning(
+            "operation=supabase_health category=unexpected_error exception=%s",
+            type(exc).__name__,
+        )
+        return JSONResponse(status_code=503, content={"database": "connection_failed"})
 
     if response.status_code == 200:
-        logger.info("Supabase health check: connected")
+        logger.info("operation=supabase_health category=connected status=200")
         return {"database": "connected"}
 
-    error_category = _categorize_error(None, response)
-    logger.warning("Supabase health check failed: %s (status=%d)", error_category, response.status_code)
+    error_category = _categorize_error(response=response)
+    logger.warning(
+        "operation=supabase_health category=%s status=%d",
+        error_category,
+        response.status_code,
+    )
     return JSONResponse(status_code=503, content={"database": "connection_failed"})
