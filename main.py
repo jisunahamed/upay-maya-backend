@@ -17,15 +17,23 @@ import httpx
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
 
+from vapi_tools import DatabaseUnavailable, router as vapi_router
+
 # Configure logging for diagnostics (server-side only)
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 app = FastAPI(
     title="Maya Demo Backend",
-    description="Railway bootstrap with Supabase connectivity check only.",
-    version="0.2.3",
+    description="Railway backend with secure Supabase and Vapi tool integration.",
+    version="0.3.0",
 )
+app.include_router(vapi_router)
+
+
+@app.exception_handler(DatabaseUnavailable)
+async def database_unavailable_handler(_request, _exc):
+    return JSONResponse(status_code=503, content={"detail": "Database service unavailable"})
 
 
 @app.get("/")
