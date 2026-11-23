@@ -109,7 +109,7 @@ is additive legacy schema support only and does not modify existing consent.
 `POST /operator/demo/outbound-calls` is not a Vapi tool. It accepts only a
 `DEMO-*` customer ID, reads the registered phone from Supabase, requires
 `contact_consent=true`, `voice_call_consent=true`, and `opted_out=false`, then
-uses Vapi `POST /call` with Maya v6 and a per-call outbound greeting override.
+uses Vapi `POST /call` with published Maya v7 and a per-call outbound greeting override.
 It remains unavailable unless `ENABLE_OUTBOUND_CALLS=true` and all private
 server configuration is valid.
 

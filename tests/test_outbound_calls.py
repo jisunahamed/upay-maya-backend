@@ -62,12 +62,12 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
         row.update(updates)
         return row
 
-    def test_payload_preserves_maya_v6_and_exact_greeting(self):
+    def test_payload_uses_maya_v7_and_preserves_exact_greeting(self):
         payload = build_vapi_outbound_payload(
             "+8801609043060", MAYA_ASSISTANT_ID, PHONE_NUMBER_ID
         )
         self.assertEqual(payload["assistantId"], MAYA_ASSISTANT_ID)
-        self.assertEqual(payload["assistantVersion"], "v6")
+        self.assertEqual(payload["assistantVersion"], "v7")
         self.assertEqual(payload["phoneNumberId"], PHONE_NUMBER_ID)
         self.assertEqual(payload["customer"]["number"], "+8801609043060")
         overrides = payload["assistantOverrides"]

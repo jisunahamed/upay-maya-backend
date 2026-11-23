@@ -19,7 +19,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter()
 
 MAYA_ASSISTANT_ID = "1f4fab2a-20f4-4fb5-93cd-88296270a89b"
-MAYA_ASSISTANT_VERSION = "v6"
+MAYA_ASSISTANT_VERSION = "v7"
 OUTBOUND_CALL_REASON = "payment_reminder"
 OUTBOUND_GREETING = (
     "আসসালামু আলাইকুম। আমি মায়া, একটি AI ডেমো কলিং সিস্টেম থেকে বলছি। "
@@ -67,7 +67,7 @@ def _vapi_config() -> tuple[str, str, str]:
 
 
 def build_vapi_outbound_payload(phone: str, assistant_id: str, phone_number_id: str) -> dict[str, Any]:
-    """Build the exact per-call override without changing saved Maya v6."""
+    """Build the exact per-call override on the published Maya v7."""
     return {
         "assistantId": assistant_id,
         "assistantVersion": MAYA_ASSISTANT_VERSION,
