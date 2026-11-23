@@ -5,8 +5,11 @@ Do not add financial-data endpoints without authentication and call-specific
 identity verification enforced in backend code.
 """
 
+import base64
+import json
 import logging
 import os
+import re
 import socket
 import ssl
 
@@ -21,7 +24,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Maya Demo Backend",
     description="Railway bootstrap with Supabase connectivity check only.",
-    version="0.2.2",
+    version="0.2.3",
 )
 
 
@@ -46,6 +49,37 @@ def _build_supabase_headers(key: str) -> dict[str, str]:
     if key.count(".") == 2 and key.startswith("eyJ"):
         headers["Authorization"] = f"Bearer {key}"
     return headers
+
+
+def _supabase_key_type(key: str) -> str:
+    """Classify a key without logging or returning any part of its value."""
+    if key.startswith("sb_secret_"):
+        return "secret"
+    if key.startswith("sb_publishable_"):
+        return "publishable"
+    if key.count(".") == 2 and key.startswith("eyJ"):
+        try:
+            payload = key.split(".")[1]
+            payload += "=" * (-len(payload) % 4)
+            role = json.loads(base64.urlsafe_b64decode(payload))["role"]
+        except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+            return "invalid"
+        if role == "service_role":
+            return "legacy_service_role"
+        if role == "anon":
+            return "legacy_anon"
+    return "invalid"
+
+
+def _safe_upstream_error_code(response: httpx.Response) -> str:
+    """Extract only a non-sensitive PostgREST error identifier."""
+    try:
+        code = response.json().get("code")
+    except (AttributeError, json.JSONDecodeError, ValueError):
+        return "unknown"
+    if isinstance(code, str) and re.fullmatch(r"[A-Za-z0-9_-]{1,32}", code):
+        return code
+    return "unknown"
 
 
 def _categorize_error(exc: Exception | None = None, response: httpx.Response | None = None) -> str:
@@ -109,6 +143,14 @@ async def database_health():
         logger.warning("operation=supabase_health category=invalid_configuration")
         return JSONResponse(status_code=503, content={"database": "invalid_configuration"})
 
+    key_type = _supabase_key_type(key)
+    if key_type not in {"secret", "legacy_service_role"}:
+        logger.warning(
+            "operation=supabase_health category=invalid_key_type key_type=%s",
+            key_type,
+        )
+        return JSONResponse(status_code=503, content={"database": "invalid_configuration"})
+
     headers = _build_supabase_headers(key)
     try:
         timeout = httpx.Timeout(connect=5.0, read=8.0, write=5.0, pool=5.0)
@@ -139,8 +181,10 @@ async def database_health():
 
     error_category = _categorize_error(response=response)
     logger.warning(
-        "operation=supabase_health category=%s status=%d",
+        "operation=supabase_health category=%s status=%d upstream_code=%s key_type=%s",
         error_category,
         response.status_code,
+        _safe_upstream_error_code(response),
+        key_type,
     )
     return JSONResponse(status_code=503, content={"database": "connection_failed"})

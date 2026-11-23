@@ -1,11 +1,12 @@
 import os
 import json
+import base64
 import unittest
 from unittest.mock import patch
 
 import httpx
 
-from main import app, database_health, _build_supabase_headers
+from main import app, database_health, _build_supabase_headers, _supabase_key_type
 
 
 class BackendTests(unittest.IsolatedAsyncioTestCase):
@@ -43,6 +44,21 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
                 with patch.dict(
                     os.environ,
                     {"SUPABASE_URL": url, "SUPABASE_SECRET_KEY": key},
+                    clear=True,
+                ):
+                    response = await self.request("/health/db")
+                self.assertEqual(response.status_code, 503)
+                self.assertEqual(response.json(), {"database": "invalid_configuration"})
+
+    async def test_database_health_rejects_public_and_anon_keys(self):
+        for key in ("sb_publishable_example", self.jwt_for_role("anon")):
+            with self.subTest(key_type=_supabase_key_type(key)):
+                with patch.dict(
+                    os.environ,
+                    {
+                        "SUPABASE_URL": "https://project.supabase.co",
+                        "SUPABASE_SECRET_KEY": key,
+                    },
                     clear=True,
                 ):
                     response = await self.request("/health/db")
@@ -109,11 +125,18 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
 
     def test_header_strategy_separates_opaque_and_legacy_keys(self):
         opaque = _build_supabase_headers("sb_secret_example")
-        legacy_key = "eyJheader.payload.signature"
+        legacy_key = self.jwt_for_role("service_role")
         legacy = _build_supabase_headers(legacy_key)
 
         self.assertNotIn("Authorization", opaque)
         self.assertEqual(legacy["Authorization"], f"Bearer {legacy_key}")
+
+    @staticmethod
+    def jwt_for_role(role: str) -> str:
+        def encode(value: bytes) -> str:
+            return base64.urlsafe_b64encode(value).decode().rstrip("=")
+
+        return f"{encode(b'{\"alg\":\"HS256\"}')}.{encode(json.dumps({'role': role}).encode())}.signature"
 
 
 if __name__ == "__main__":
