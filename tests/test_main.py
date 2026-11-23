@@ -22,7 +22,24 @@ class BackendTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(root.status_code, 200)
         self.assertEqual(root.json()["service"], "upay-maya-backend")
         self.assertEqual(health.status_code, 200)
-        self.assertEqual(health.json(), {"status": "ok"})
+        self.assertEqual(
+            health.json(),
+            {
+                "status": "ok",
+                "version": "0.6.0",
+                "capabilities": {"verify_demo_identity": True},
+            },
+        )
+
+    async def test_health_exposes_sanitized_railway_commit(self):
+        with patch.dict(
+            os.environ,
+            {"RAILWAY_GIT_COMMIT_SHA": "3f6ab44c472a56c1d6e09c9bda0bac88b9fb3d5d"},
+            clear=True,
+        ):
+            health = await self.request("/health")
+
+        self.assertEqual(health.json()["commit"], "3f6ab44")
 
     async def test_database_health_rejects_missing_configuration_safely(self):
         with patch.dict(os.environ, {}, clear=True):

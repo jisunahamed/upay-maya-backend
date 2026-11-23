@@ -47,7 +47,15 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    response = {
+        "status": "ok",
+        "version": app.version,
+        "capabilities": {"verify_demo_identity": True},
+    }
+    commit = os.getenv("RAILWAY_GIT_COMMIT_SHA", "")
+    if re.fullmatch(r"[0-9a-fA-F]{7,40}", commit):
+        response["commit"] = commit[:7]
+    return response
 
 
 def _build_supabase_headers(key: str) -> dict[str, str]:
