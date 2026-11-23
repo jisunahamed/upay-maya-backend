@@ -80,9 +80,10 @@ initial greeting.
 
 ## Consent-gated outbound initiation
 
-Run `migrations/002_outbound_call_consent.sql` before enabling outbound calls.
-It adds nullable `voice_call_consent` and `opted_out` fields without changing
-existing consent. `NULL` fails closed.
+The active consent authority is one `customer_contact_preferences` row per
+customer. It must contain `voice_call_consent=true` and `opted_out=false`;
+missing or duplicate rows fail closed. Migration `002_outbound_call_consent.sql`
+is additive legacy schema support only and does not modify existing consent.
 
 `POST /operator/demo/outbound-calls` is not a Vapi tool. It accepts only a
 `DEMO-*` customer ID, reads the registered phone from Supabase, requires

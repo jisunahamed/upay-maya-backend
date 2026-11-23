@@ -127,10 +127,7 @@ async def initiate_demo_outbound_call(request: Request) -> dict[str, str]:
     customers = await _supabase_get(
         "customers",
         {
-            "select": (
-                "customer_id,registered_phone,account_status,contact_consent,"
-                "voice_call_consent,opted_out"
-            ),
+            "select": "customer_id,registered_phone,account_status,contact_consent",
             "customer_id": f"eq.{body.customer_id}",
             "limit": "2",
         },
@@ -138,10 +135,23 @@ async def initiate_demo_outbound_call(request: Request) -> dict[str, str]:
     if len(customers) != 1 or customers[0].get("account_status") != "demo":
         raise HTTPException(status_code=404, detail="Eligible demo customer not found")
     customer = customers[0]
+    # Voice consent is maintained independently from the customer profile.
+    # Missing or duplicate preference rows must fail closed.
+    preferences = await _supabase_get(
+        "customer_contact_preferences",
+        {
+            "select": "customer_id,voice_call_consent,opted_out",
+            "customer_id": f"eq.{body.customer_id}",
+            "limit": "2",
+        },
+    )
+    if len(preferences) != 1 or preferences[0].get("customer_id") != body.customer_id:
+        raise HTTPException(status_code=409, detail="Voice call consent requirements are not satisfied")
+    preference = preferences[0]
     if (
         customer.get("contact_consent") is not True
-        or customer.get("voice_call_consent") is not True
-        or customer.get("opted_out") is not False
+        or preference.get("voice_call_consent") is not True
+        or preference.get("opted_out") is not False
     ):
         raise HTTPException(status_code=409, detail="Voice call consent requirements are not satisfied")
     phone = normalize_bangladesh_phone(customer.get("registered_phone"))

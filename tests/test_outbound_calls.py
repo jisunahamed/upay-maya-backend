@@ -48,6 +48,14 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
             "registered_phone": "+8801609043060",
             "account_status": "demo",
             "contact_consent": True,
+        }
+        row.update(updates)
+        return row
+
+    @staticmethod
+    def allowed_preference(**updates):
+        row = {
+            "customer_id": "DEMO-UPAY-001",
             "voice_call_consent": True,
             "opted_out": False,
         }
@@ -92,7 +100,18 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
         for updates in cases:
             with self.subTest(updates=updates):
                 provider = AsyncMock()
-                reads = AsyncMock(return_value=[self.allowed_customer(**updates)])
+                customer_updates = {
+                    key: value for key, value in updates.items() if key == "contact_consent"
+                }
+                preference_updates = {
+                    key: value for key, value in updates.items() if key != "contact_consent"
+                }
+                reads = AsyncMock(
+                    side_effect=[
+                        [self.allowed_customer(**customer_updates)],
+                        [self.allowed_preference(**preference_updates)],
+                    ]
+                )
                 with patch.dict(os.environ, self.environment(), clear=True), patch(
                     "outbound_calls._supabase_get", reads
                 ), patch("outbound_calls._create_vapi_call", provider):
@@ -104,6 +123,7 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
         reads = AsyncMock(
             side_effect=[
                 [self.allowed_customer()],
+                [self.allowed_preference()],
                 [
                     {
                         "customer_id": "DEMO-UPAY-001",
@@ -140,6 +160,7 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
         reads = AsyncMock(
             side_effect=[
                 [self.allowed_customer()],
+                [self.allowed_preference()],
                 [
                     {
                         "customer_id": "DEMO-UPAY-001",
@@ -163,10 +184,25 @@ class OutboundCallTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("private", response.text.lower())
         writes.assert_not_awaited()
 
+    async def test_missing_or_duplicate_preference_fails_closed(self):
+        for preference_rows in ([], [self.allowed_preference(), self.allowed_preference()]):
+            with self.subTest(preference_rows=preference_rows):
+                reads = AsyncMock(
+                    side_effect=[[self.allowed_customer()], preference_rows]
+                )
+                provider = AsyncMock()
+                with patch.dict(os.environ, self.environment(), clear=True), patch(
+                    "outbound_calls._supabase_get", reads
+                ), patch("outbound_calls._create_vapi_call", provider):
+                    response = await self.post()
+                self.assertEqual(response.status_code, 409)
+                provider.assert_not_awaited()
+
     async def test_post_provider_database_failure_warns_without_retry_signal(self):
         reads = AsyncMock(
             side_effect=[
                 [self.allowed_customer()],
+                [self.allowed_preference()],
                 [
                     {
                         "customer_id": "DEMO-UPAY-001",
