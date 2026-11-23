@@ -129,7 +129,7 @@ async def _supabase_write(
     table: str,
     *,
     params: dict[str, str],
-    payload: dict[str, Any],
+    payload: Any,
     prefer: str = "return=representation",
 ) -> list[dict[str, Any]]:
     url, key = _supabase_config()

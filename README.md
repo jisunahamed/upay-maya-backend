@@ -23,6 +23,14 @@ Open `http://127.0.0.1:8000/health` to confirm `{"status":"ok"}`.
   authorized synthetic-data verification test.
 - `OPERATOR_API_SECRET`: Separate random value of at least 32 characters for
   the demo-only operator approval endpoint.
+- `TRANSCRIPT_STORAGE_ENABLED`: Global transcript/message persistence switch;
+  keep `false` until the retention and consent policy is approved.
+- `TRANSCRIPT_RETENTION_DAYS`: Approved retention period from 1 to 3650 days.
+  No default policy is assumed.
+- `STORE_RECORDING_REFERENCES`: Stores an HTTPS recording reference only when
+  enabled and Vapi reports explicit recording consent through `grantedAt`.
+- `STORE_CALLER_PHONE`: Stores the caller number in `call_logs` only when the
+  approved policy allows it.
 
 Never reuse the Vapi or operator secrets for Supabase, Twilio, or another
 service.
@@ -40,6 +48,33 @@ service.
 
 The operator endpoint accepts only `DEMO-*` identifiers and is disabled by
 default. Do not turn it into a model-callable Vapi tool.
+
+## Call history webhook
+
+`POST /vapi/events` accepts authenticated Vapi `end-of-call-report` events.
+It upserts call metadata by Vapi Call ID and, when the explicit storage policy
+allows it, stores one canonical transcript plus ordered customer/assistant
+messages. System prompts, tool payloads, partial transcripts, and common secret
+patterns are excluded or redacted before persistence.
+
+Run `migrations/001_vapi_call_history.sql` in the Supabase SQL Editor before
+enabling the event route. It adds the `call_messages` table and two additive
+columns to `call_transcripts`; it does not drop or truncate data.
+
+Per-call transcript permission must come from trusted call metadata:
+
+```json
+{"metadata":{"customerId":"DEMO-UPAY-001","transcriptStoragePermitted":true}}
+```
+
+Do not set `transcriptStoragePermitted` from model output. Recording consent is
+checked separately and does not automatically authorize transcript storage.
+
+Vapi does not retry server messages by default. Configure the saved assistant
+server with an API-managed bounded `backoffPlan`, for example exponential
+backoff with `maxRetries: 3` and non-retryable `400`, `401`, `403`, and `404`
+status codes. The database writes are idempotent so duplicate deliveries do not
+duplicate transcripts or messages.
 
 ## Deploy on Railway
 
