@@ -10,6 +10,7 @@ import hmac
 import json
 import logging
 import os
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -33,6 +34,98 @@ class DemoVerificationRequest(BaseModel):
     vapi_call_id: str = Field(min_length=1, max_length=128, pattern=r"^[A-Za-z0-9_-]+$")
     customer_id: str = Field(min_length=1, max_length=64, pattern=r"^DEMO-[A-Za-z0-9-]+$")
     payment_reference: str = Field(min_length=1, max_length=64, pattern=r"^DEMO-[A-Za-z0-9-]+$")
+
+
+_BANGLADESH_MOBILE = re.compile(r"^01[3-9][0-9]{8}$")
+_TRUSTED_CALL_REASONS = {
+    "general_support",
+    "payment_reminder",
+    "payment_status_demo",
+    "support_follow_up",
+}
+
+
+def normalize_bangladesh_phone(value: Any) -> str | None:
+    """Normalize a complete Bangladesh mobile number to E.164.
+
+    Common presentation characters are ignored, but missing digits are never
+    reconstructed and fuzzy matching is intentionally unsupported.
+    """
+    if not isinstance(value, str):
+        return None
+    compact = re.sub(r"[\s().-]", "", value.strip())
+    if compact.startswith("+"):
+        compact = compact[1:]
+    if compact.startswith("880"):
+        local = f"0{compact[3:]}"
+    else:
+        local = compact
+    if not _BANGLADESH_MOBILE.fullmatch(local):
+        return None
+    return f"+880{local[1:]}"
+
+
+def _call_direction(call: dict[str, Any]) -> str:
+    call_type = call.get("type")
+    if call_type == "outboundPhoneCall":
+        return "outbound"
+    if call_type == "inboundPhoneCall":
+        return "inbound"
+    return "unknown"
+
+
+def _trusted_call_reason(call: dict[str, Any]) -> str | None:
+    metadata = call.get("metadata") if isinstance(call.get("metadata"), dict) else {}
+    overrides = (
+        call.get("assistantOverrides")
+        if isinstance(call.get("assistantOverrides"), dict)
+        else {}
+    )
+    variables = (
+        overrides.get("variableValues")
+        if isinstance(overrides.get("variableValues"), dict)
+        else {}
+    )
+    candidates = (
+        metadata.get("callReason"),
+        metadata.get("call_reason"),
+        variables.get("call_reason"),
+    )
+    return next((item for item in candidates if item in _TRUSTED_CALL_REASONS), None)
+
+
+def _candidate_phone(call: dict[str, Any], arguments: dict[str, Any]) -> tuple[str, bool]:
+    customer = call.get("customer") if isinstance(call.get("customer"), dict) else {}
+    trusted_value = customer.get("number")
+    if trusted_value is not None:
+        trusted_phone = normalize_bangladesh_phone(trusted_value)
+        if trusted_phone is None:
+            raise ToolFailure("Call context-এ সম্পূর্ণ বৈধ Bangladesh phone number নেই।")
+        supplied = next(
+            (
+                arguments.get(key)
+                for key in ("lookup_value", "phone_number", "phone")
+                if arguments.get(key) is not None
+            ),
+            None,
+        )
+        supplied_phone = normalize_bangladesh_phone(supplied)
+        if supplied is not None and supplied_phone != trusted_phone:
+            logger.info("operation=customer_profile category=ignored_conflicting_model_phone")
+        return trusted_phone, True
+
+    supplied = next(
+        (
+            arguments.get(key)
+            for key in ("lookup_value", "phone_number", "phone")
+            if arguments.get(key) is not None
+        ),
+        None,
+    )
+    supplied_phone = normalize_bangladesh_phone(supplied)
+    if supplied_phone is None:
+        raise ToolFailure("সম্পূর্ণ বৈধ registered phone number প্রয়োজন।")
+    return supplied_phone, False
 
 
 def _authenticate_vapi(request: Request) -> None:
@@ -182,6 +275,138 @@ def _tool_arguments(tool_call: dict[str, Any]) -> tuple[str, dict[str, Any]]:
     return function["name"], arguments
 
 
+async def get_customer_profile(
+    call_id: str,
+    call: dict[str, Any],
+    arguments: dict[str, Any],
+) -> str:
+    """Find a candidate customer without treating phone possession as identity proof."""
+    phone, from_trusted_context = _candidate_phone(call, arguments)
+    preassociated_call: dict[str, Any] | None = None
+    if not from_trusted_context:
+        preassociated_rows = await _supabase_get(
+            "call_logs",
+            {
+                "select": (
+                    "id,customer_id,phone_number,call_direction,call_reason,"
+                    "identity_verified,ended_at"
+                ),
+                "vapi_call_id": f"eq.{call_id}",
+                "limit": "2",
+            },
+        )
+        if len(preassociated_rows) != 1:
+            raise ToolFailure("এই call-এর জন্য trusted phone association পাওয়া যায়নি।")
+        preassociated_call = preassociated_rows[0]
+        if (
+            preassociated_call.get("ended_at") is not None
+            or normalize_bangladesh_phone(preassociated_call.get("phone_number")) != phone
+            or not isinstance(preassociated_call.get("customer_id"), str)
+        ):
+            raise ToolFailure("এই call-এর trusted phone association মেলেনি।")
+
+    customer_rows = await _supabase_get(
+        "customers",
+        {
+            "select": (
+                "customer_id,customer_name,registered_phone,account_status,"
+                "preferred_language"
+            ),
+            "registered_phone": f"eq.{phone}",
+            "limit": "2",
+        },
+    )
+    if len(customer_rows) != 1:
+        raise ToolFailure("এই phone number-এর জন্য customer profile পাওয়া যায়নি।")
+
+    customer = customer_rows[0]
+    customer_id = customer.get("customer_id")
+    if (
+        not isinstance(customer_id, str)
+        or not customer_id
+        or normalize_bangladesh_phone(customer.get("registered_phone")) != phone
+    ):
+        raise ToolFailure("Customer profile নিরাপদভাবে যাচাই করা যায়নি।")
+
+    identity_verified = False
+    association_created = False
+    direction = _call_direction(call)
+    reason = _trusted_call_reason(call)
+    if from_trusted_context:
+        call_rows = await _supabase_get(
+            "call_logs",
+            {
+                "select": (
+                    "id,customer_id,phone_number,call_direction,call_reason,"
+                    "identity_verified,ended_at"
+                ),
+                "vapi_call_id": f"eq.{call_id}",
+                "limit": "2",
+            },
+        )
+        if len(call_rows) > 1:
+            raise DatabaseUnavailable
+
+        association_payload: dict[str, Any] = {
+            "customer_id": customer_id,
+            "phone_number": phone,
+            "call_direction": direction,
+        }
+        if reason is not None:
+            association_payload["call_reason"] = reason
+
+        if call_rows:
+            current = call_rows[0]
+            current_customer = current.get("customer_id")
+            current_phone = current.get("phone_number")
+            if current.get("ended_at") is not None:
+                raise ToolFailure("এই call আর active নেই।")
+            if current_customer not in {None, customer_id}:
+                raise ToolFailure("Call context অন্য customer-এর সঙ্গে যুক্ত।")
+            if current_phone is not None and normalize_bangladesh_phone(current_phone) != phone:
+                raise ToolFailure("Call context-এর phone association মেলেনি।")
+            written = await _supabase_write(
+                "PATCH",
+                "call_logs",
+                params={"id": f"eq.{current['id']}"},
+                payload=association_payload,
+            )
+            identity_verified = current.get("identity_verified") is True
+        else:
+            written = await _supabase_write(
+                "POST",
+                "call_logs",
+                params={},
+                payload={
+                    "vapi_call_id": call_id,
+                    **association_payload,
+                    "call_status": "active",
+                    "identity_verified": False,
+                },
+            )
+        if len(written) != 1:
+            raise DatabaseUnavailable
+        association_created = True
+    elif preassociated_call is not None:
+        if preassociated_call.get("customer_id") != customer_id:
+            raise ToolFailure("Call context অন্য customer-এর সঙ্গে যুক্ত।")
+        identity_verified = preassociated_call.get("identity_verified") is True
+        association_created = True
+
+    result = {
+        "success": True,
+        "customer_found": True,
+        "customer_id": customer_id,
+        "customer_name": customer.get("customer_name"),
+        "account_status": customer.get("account_status"),
+        "preferred_language": customer.get("preferred_language"),
+        "identity_verified": identity_verified,
+        "verification_required": not identity_verified,
+        "call_associated": association_created,
+    }
+    return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
+
+
 async def get_payment_status(call_id: str, arguments: dict[str, Any]) -> str:
     """Return a payment record only for the verified customer bound to a call."""
     call_rows = await _supabase_get(
@@ -259,23 +484,34 @@ async def get_payment_status(call_id: str, arguments: dict[str, Any]) -> str:
         "record_type": "payment",
         "customer_id": customer_id,
         "payment_reference": trusted_reference,
+        "payment_type": payment.get("payment_type"),
         "payment_status": payment.get("payment_status"),
         "currency": payment.get("currency"),
         "due_date": payment.get("due_date"),
     }
-    if arguments.get("include_outstanding_balance") is True:
+    if (
+        arguments.get("include_outstanding_balance") is True
+        and payment.get("payment_status") == "outstanding"
+    ):
         result["outstanding_amount"] = payment.get("outstanding_amount")
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
-async def _execute_tool(call_id: str, tool_call: dict[str, Any]) -> dict[str, str]:
+async def _execute_tool(
+    call_id: str,
+    call: dict[str, Any],
+    tool_call: dict[str, Any],
+) -> dict[str, str]:
     tool_call_id = tool_call["id"]
     try:
         name, arguments = _tool_arguments(tool_call)
-        if name != "get_payment_status":
+        if name == "get_customer_profile":
+            result = await get_customer_profile(call_id, call, arguments)
+        elif name == "get_payment_status":
+            result = await get_payment_status(call_id, arguments)
+        else:
             raise ToolFailure("এই tool-টি বর্তমানে backend-এ সক্রিয় নয়।")
-        result = await get_payment_status(call_id, arguments)
-        logger.info("operation=vapi_tool tool=get_payment_status category=success")
+        logger.info("operation=vapi_tool tool=%s category=success", name)
         return {"toolCallId": tool_call_id, "result": result}
     except ToolFailure as exc:
         logger.info("operation=vapi_tool category=controlled_failure")
@@ -284,7 +520,7 @@ async def _execute_tool(call_id: str, tool_call: dict[str, Any]) -> dict[str, st
         logger.warning("operation=vapi_tool category=database_unavailable")
         return {
             "toolCallId": tool_call_id,
-            "error": "Payment তথ্য এই মুহূর্তে নিরাপদভাবে যাচাই করা যাচ্ছে না।",
+            "error": "তথ্য এই মুহূর্তে নিরাপদভাবে যাচাই করা যাচ্ছে না।",
         }
     except Exception as exc:
         logger.warning(
@@ -313,7 +549,7 @@ async def vapi_tools(request: Request) -> dict[str, list[dict[str, str]]]:
     if not all(isinstance(item, dict) and isinstance(item.get("id"), str) for item in tool_calls):
         raise HTTPException(status_code=400, detail="Invalid tool call identifier")
 
-    results = [await _execute_tool(call_id, tool_call) for tool_call in tool_calls]
+    results = [await _execute_tool(call_id, call, tool_call) for tool_call in tool_calls]
     return {"results": results}
 
 
@@ -345,43 +581,27 @@ async def verify_demo_call(request: Request) -> dict[str, str]:
     call_rows = await _supabase_get(
         "call_logs",
         {
-            "select": "id,customer_id,ended_at,structured_output",
+            "select": "id,customer_id,identity_verified,ended_at,structured_output",
             "vapi_call_id": f"eq.{verification.vapi_call_id}",
             "limit": "2",
         },
     )
-    if len(call_rows) > 1:
-        raise DatabaseUnavailable
+    if len(call_rows) != 1:
+        raise HTTPException(status_code=409, detail="Demo call must already have a trusted association")
 
-    if call_rows:
-        call = call_rows[0]
-        if call.get("customer_id") != verification.customer_id or call.get("ended_at") is not None:
-            raise HTTPException(status_code=409, detail="Demo call association conflict")
-        structured_output = call.get("structured_output")
-        if not isinstance(structured_output, dict):
-            structured_output = {}
-        structured_output = {**structured_output, "payment_reference": verification.payment_reference}
-        written_calls = await _supabase_write(
-            "PATCH",
-            "call_logs",
-            params={"id": f"eq.{call['id']}"},
-            payload={"identity_verified": True, "structured_output": structured_output},
-        )
-    else:
-        written_calls = await _supabase_write(
-            "POST",
-            "call_logs",
-            params={},
-            payload={
-                "vapi_call_id": verification.vapi_call_id,
-                "customer_id": verification.customer_id,
-                "call_direction": "demo",
-                "call_reason": "payment_status_demo",
-                "call_status": "active",
-                "identity_verified": True,
-                "structured_output": {"payment_reference": verification.payment_reference},
-            },
-        )
+    call = call_rows[0]
+    if call.get("customer_id") != verification.customer_id or call.get("ended_at") is not None:
+        raise HTTPException(status_code=409, detail="Demo call association conflict")
+    structured_output = call.get("structured_output")
+    if not isinstance(structured_output, dict):
+        structured_output = {}
+    structured_output = {**structured_output, "payment_reference": verification.payment_reference}
+    written_calls = await _supabase_write(
+        "PATCH",
+        "call_logs",
+        params={"id": f"eq.{call['id']}"},
+        payload={"identity_verified": True, "structured_output": structured_output},
+    )
     if len(written_calls) != 1 or not isinstance(written_calls[0].get("id"), str):
         raise DatabaseUnavailable
 

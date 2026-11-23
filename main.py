@@ -27,7 +27,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Maya Demo Backend",
     description="Railway backend with secure Supabase and Vapi tool integration.",
-    version="0.4.0",
+    version="0.5.0",
 )
 app.include_router(vapi_router)
 app.include_router(vapi_events_router)

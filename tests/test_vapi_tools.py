@@ -6,7 +6,7 @@ from unittest.mock import AsyncMock, patch
 import httpx
 
 from main import app
-from vapi_tools import DatabaseUnavailable
+from vapi_tools import DatabaseUnavailable, normalize_bangladesh_phone
 
 
 WEBHOOK_SECRET = "test-webhook-secret-with-at-least-32-characters"
@@ -26,11 +26,17 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
             return await client.post("/operator/demo/verify-call", json=payload, headers=headers)
 
     @staticmethod
-    def payload(arguments=None, *, tool_name="get_payment_status", tool_id="tool-call-1"):
+    def payload(
+        arguments=None,
+        *,
+        tool_name="get_payment_status",
+        tool_id="tool-call-1",
+        call=None,
+    ):
         return {
             "message": {
                 "type": "tool-calls",
-                "call": {"id": "vapi-call-1"},
+                "call": call or {"id": "vapi-call-1"},
                 "toolCallList": [
                     {
                         "id": tool_id,
@@ -42,6 +48,15 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
                     }
                 ],
             }
+        }
+
+    @staticmethod
+    def outbound_call(number="+8801609043060", *, reason="payment_reminder"):
+        return {
+            "id": "vapi-call-1",
+            "type": "outboundPhoneCall",
+            "customer": {"number": number},
+            "assistantOverrides": {"variableValues": {"call_reason": reason}},
         }
 
     @staticmethod
@@ -88,6 +103,146 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(missing.status_code, 401)
         self.assertEqual(wrong.status_code, 401)
 
+    def test_bangladesh_phone_normalization_is_exact(self):
+        expected = "+8801609043060"
+        self.assertEqual(normalize_bangladesh_phone("01609043060"), expected)
+        self.assertEqual(normalize_bangladesh_phone("+8801609043060"), expected)
+        self.assertEqual(normalize_bangladesh_phone("8801609043060"), expected)
+        self.assertEqual(normalize_bangladesh_phone("+880 1609-043060"), expected)
+        self.assertIsNone(normalize_bangladesh_phone("0609043060"))
+        self.assertIsNone(normalize_bangladesh_phone("0160904306"))
+        self.assertIsNone(normalize_bangladesh_phone("016090430600"))
+
+    async def test_customer_profile_uses_trusted_outbound_number_and_associates_call(self):
+        reads = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "customer_id": "DEMO-UPAY-001",
+                        "customer_name": "Jisun",
+                        "registered_phone": "+8801609043060",
+                        "account_status": "demo",
+                        "preferred_language": "bn-BD",
+                    }
+                ],
+                [],
+            ]
+        )
+        writes = AsyncMock(return_value=[{"id": "call-log-uuid"}])
+        payload = self.payload(
+            {"lookup_value": "0609043060", "customer_id": "MODEL-INVENTED"},
+            tool_name="get_customer_profile",
+            call=self.outbound_call(),
+        )
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", reads
+        ), patch("vapi_tools._supabase_write", writes):
+            response = await self.post(payload)
+
+        item = response.json()["results"][0]
+        self.assertEqual(response.status_code, 200)
+        profile = json.loads(item["result"])
+        self.assertEqual(profile["customer_id"], "DEMO-UPAY-001")
+        self.assertEqual(profile["customer_name"], "Jisun")
+        self.assertFalse(profile["identity_verified"])
+        self.assertTrue(profile["verification_required"])
+        self.assertNotIn("outstanding_amount", item["result"])
+        customer_query = reads.await_args_list[0].args[1]
+        self.assertEqual(customer_query["registered_phone"], "eq.+8801609043060")
+        association = writes.await_args.kwargs["payload"]
+        self.assertEqual(association["customer_id"], "DEMO-UPAY-001")
+        self.assertEqual(association["call_direction"], "outbound")
+        self.assertEqual(association["call_reason"], "payment_reminder")
+        self.assertFalse(association["identity_verified"])
+
+    async def test_customer_profile_rejects_incomplete_untrusted_transcription(self):
+        database = AsyncMock()
+        payload = self.payload(
+            {"lookup_value": "0609043060"},
+            tool_name="get_customer_profile",
+            call={"id": "vapi-call-1", "type": "webCall"},
+        )
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", database
+        ):
+            response = await self.post(payload)
+        self.assertIn("error", response.json()["results"][0])
+        database.assert_not_awaited()
+
+    async def test_model_phone_requires_existing_backend_association(self):
+        database = AsyncMock(return_value=[])
+        payload = self.payload(
+            {"lookup_value": "01609043060"},
+            tool_name="get_customer_profile",
+            call={"id": "vapi-call-1", "type": "webCall"},
+        )
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", database
+        ):
+            response = await self.post(payload)
+        self.assertIn("error", response.json()["results"][0])
+        self.assertEqual(database.await_count, 1)
+
+    async def test_customer_profile_unknown_number_returns_controlled_error(self):
+        database = AsyncMock(return_value=[])
+        payload = self.payload(
+            tool_name="get_customer_profile",
+            call=self.outbound_call("+8801711111111"),
+        )
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", database
+        ):
+            response = await self.post(payload)
+        item = response.json()["results"][0]
+        self.assertIn("error", item)
+        self.assertNotIn("customer_id", json.dumps(item))
+
+    async def test_inbound_phone_creates_unverified_candidate_association(self):
+        reads = AsyncMock(
+            side_effect=[
+                [
+                    {
+                        "customer_id": "DEMO-UPAY-001",
+                        "customer_name": "Jisun",
+                        "registered_phone": "+8801609043060",
+                        "account_status": "demo",
+                        "preferred_language": "bn-BD",
+                    }
+                ],
+                [],
+            ]
+        )
+        writes = AsyncMock(return_value=[{"id": "call-log-uuid"}])
+        call = {
+            "id": "vapi-call-1",
+            "type": "inboundPhoneCall",
+            "customer": {"number": "+8801609043060"},
+        }
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", reads
+        ), patch("vapi_tools._supabase_write", writes):
+            response = await self.post(
+                self.payload(tool_name="get_customer_profile", call=call)
+            )
+        profile = json.loads(response.json()["results"][0]["result"])
+        self.assertFalse(profile["identity_verified"])
+        association = writes.await_args.kwargs["payload"]
+        self.assertEqual(association["call_direction"], "inbound")
+        self.assertFalse(association["identity_verified"])
+
+    async def test_customer_profile_database_failure_is_sanitized(self):
+        payload = self.payload(
+            tool_name="get_customer_profile",
+            call=self.outbound_call(),
+        )
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", AsyncMock(side_effect=DatabaseUnavailable)
+        ):
+            response = await self.post(payload)
+        item = response.json()["results"][0]
+        self.assertIn("error", item)
+        self.assertNotIn("Supabase", item["error"])
+
     async def test_verified_customer_returns_vapi_string_result(self):
         database = AsyncMock(side_effect=self.verified_rows())
         arguments = {
@@ -109,6 +264,22 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["payment_reference"], "DEMO-PAY-A")
         self.assertEqual(result["outstanding_amount"], 4250)
         self.assertEqual(database.await_count, 3)
+
+    async def test_pending_transaction_is_not_reported_as_outstanding_bill(self):
+        rows = self.verified_rows()
+        rows[2][0]["payment_status"] = "pending"
+        rows[2][0]["payment_type"] = "transaction"
+        database = AsyncMock(side_effect=rows)
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True), patch(
+            "vapi_tools._supabase_get", database
+        ):
+            response = await self.post(
+                self.payload({"include_outstanding_balance": True})
+            )
+        result = json.loads(response.json()["results"][0]["result"])
+        self.assertEqual(result["payment_status"], "pending")
+        self.assertEqual(result["payment_type"], "transaction")
+        self.assertNotIn("outstanding_amount", result)
 
     async def test_unverified_customer_never_receives_financial_data(self):
         database = AsyncMock(
@@ -215,11 +386,19 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
             )
         self.assertEqual(response.status_code, 404)
 
-    async def test_authenticated_operator_can_create_verified_demo_association(self):
+    async def test_authenticated_operator_can_verify_existing_demo_association(self):
         reads = AsyncMock(
             side_effect=[
                 [{"customer_id": "DEMO-CUSTOMER-A", "payment_reference": "DEMO-PAY-A"}],
-                [],
+                [
+                    {
+                        "id": "call-log-uuid",
+                        "customer_id": "DEMO-CUSTOMER-A",
+                        "identity_verified": False,
+                        "ended_at": None,
+                        "structured_output": {},
+                    }
+                ],
             ]
         )
         writes = AsyncMock(side_effect=[[{"id": "call-log-uuid"}], [{"id": "verification-uuid"}]])
@@ -245,6 +424,29 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
         verification_write = writes.await_args_list[1].kwargs["payload"]
         self.assertEqual(verification_write["verification_method"], "operator_approved_demo")
         self.assertTrue(verification_write["verified"])
+
+    async def test_operator_cannot_verify_call_without_trusted_association(self):
+        reads = AsyncMock(
+            side_effect=[
+                [{"customer_id": "DEMO-CUSTOMER-A", "payment_reference": "DEMO-PAY-A"}],
+                [],
+            ]
+        )
+        environment = {
+            "ENABLE_DEMO_OPERATOR_VERIFICATION": "true",
+            "OPERATOR_API_SECRET": WEBHOOK_SECRET,
+        }
+        with patch.dict(os.environ, environment, clear=True), patch(
+            "vapi_tools._supabase_get", reads
+        ):
+            response = await self.operator_post(
+                {
+                    "vapi_call_id": "demo-call-1",
+                    "customer_id": "DEMO-CUSTOMER-A",
+                    "payment_reference": "DEMO-PAY-A",
+                }
+            )
+        self.assertEqual(response.status_code, 409)
 
     async def test_operator_cannot_reassign_existing_call(self):
         reads = AsyncMock(

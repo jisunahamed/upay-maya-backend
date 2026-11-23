@@ -37,17 +37,37 @@ service.
 
 ## Secure payment lookup flow
 
-1. A trusted system records the Vapi call ID, customer ID, and payment
-   reference in `call_logs`.
-2. An authorized operator completes an approved synthetic demo challenge and
+1. `get_customer_profile` prefers the authenticated Vapi webhook's
+   `message.call.customer.number`, normalizes complete Bangladesh mobile
+   numbers to E.164, and records an unverified call/customer candidate
+   association. A conflicting model-generated phone is ignored.
+2. A trusted system records the payment reference for that call. Phone
+   possession and profile lookup alone never authorize financial disclosure.
+3. An authorized operator completes an approved synthetic demo challenge and
    invokes `POST /operator/demo/verify-call`.
-3. The backend records verification in `call_identity_verifications`.
-4. Vapi calls `POST /vapi/tools` with its saved Bearer credential.
-5. The backend requires the call association and verification record before it
+4. The backend records verification in `call_identity_verifications`.
+5. Vapi calls `POST /vapi/tools` with its saved Bearer credential.
+6. The backend requires the call association and verification record before it
    reads the matching `payment_records` row.
 
 The operator endpoint accepts only `DEMO-*` identifiers and is disabled by
-default. Do not turn it into a model-callable Vapi tool.
+default. It refuses calls that do not already have a trusted customer
+association. Do not turn it into a model-callable Vapi tool.
+
+For an authorized future outbound-call API, pass a non-sensitive reason in
+Vapi's supported per-call override without changing the saved assistant:
+
+```json
+{
+  "assistantOverrides": {
+    "variableValues": {"call_reason": "payment_reminder"}
+  }
+}
+```
+
+The backend accepts only an allowlisted reason from trusted call context. It
+does not currently initiate calls, and no amount or due date belongs in the
+initial greeting.
 
 ## Call history webhook
 
