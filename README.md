@@ -52,16 +52,37 @@ service.
    association. A conflicting model-generated phone is ignored.
 2. A trusted system records the payment reference for that call. Phone
    possession and profile lookup alone never authorize financial disclosure.
-3. An authorized operator completes an approved synthetic demo challenge and
-   invokes `POST /operator/demo/verify-call`.
-4. The backend records verification in `call_identity_verifications`.
-5. Vapi calls `POST /vapi/tools` with its saved Bearer credential.
-6. The backend requires the call association and verification record before it
+3. For an explicitly synthetic demo call, Vapi can invoke
+   `verify_demo_identity` after the profile lookup. It accepts only
+   `registered_phone_last4`, compares four Bengali or English digits to the
+   backend-known registered number, and permits two attempts for that call.
+4. The backend records a successful verification in
+   `call_identity_verifications` and marks only that `call_logs` record as
+   verified. It never marks the customer record verified.
+5. An authorized operator can alternatively complete an approved synthetic
+   demo challenge through `POST /operator/demo/verify-call`.
+6. Vapi calls `POST /vapi/tools` with its saved Bearer credential.
+7. The backend requires the call association and verification record before it
    reads the matching `payment_records` row.
 
 The operator endpoint accepts only `DEMO-*` identifiers and is disabled by
 default. It refuses calls that do not already have a trusted customer
 association. Do not turn it into a model-callable Vapi tool.
+
+`verify_demo_identity` is a demo-only Vapi Function Tool; it is not a
+production identity workflow and must never request a PIN, OTP, CVV, password,
+or full phone number. Its input is:
+
+```json
+{
+  "customer_id": "DEMO-UPAY-001",
+  "verification_method": "registered_phone_last4",
+  "provided_last4": "৩০৬০"
+}
+```
+
+The authenticated webhook's call ID and caller number, plus the backend call
+association, are the authority. Model-supplied phone values are ignored.
 
 For an authorized future outbound-call API, pass a non-sensitive reason in
 Vapi's supported per-call override without changing the saved assistant:

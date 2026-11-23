@@ -37,6 +37,7 @@ class DemoVerificationRequest(BaseModel):
 
 
 _BANGLADESH_MOBILE = re.compile(r"^01[3-9][0-9]{8}$")
+_BENGALI_DIGITS = str.maketrans("০১২৩৪৫৬৭৮৯", "0123456789")
 _TRUSTED_CALL_REASONS = {
     "general_support",
     "payment_reminder",
@@ -63,6 +64,14 @@ def normalize_bangladesh_phone(value: Any) -> str | None:
     if not _BANGLADESH_MOBILE.fullmatch(local):
         return None
     return f"+880{local[1:]}"
+
+
+def normalize_demo_last4(value: Any) -> str | None:
+    """Accept exactly four ASCII or Bengali digits for the synthetic demo only."""
+    if not isinstance(value, str):
+        return None
+    compact = re.sub(r"[\s-]", "", value.translate(_BENGALI_DIGITS))
+    return compact if re.fullmatch(r"[0-9]{4}", compact) else None
 
 
 def _call_direction(call: dict[str, Any]) -> str:
@@ -407,6 +416,174 @@ async def get_customer_profile(
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _demo_attempt_count(structured_output: Any) -> int:
+    if not isinstance(structured_output, dict):
+        return 0
+    count = structured_output.get("demo_identity_attempts")
+    if count is None:
+        return 0
+    # Do not reset an unexpected persisted counter: that could allow more
+    # than two attempts after state corruption.
+    if isinstance(count, bool) or not isinstance(count, int) or not 0 <= count <= 2:
+        raise ToolFailure("Demo verification state নিরাপদভাবে পড়া যায়নি।")
+    return count
+
+
+async def verify_demo_identity(
+    call_id: str,
+    call: dict[str, Any],
+    arguments: dict[str, Any],
+) -> str:
+    """Verify a synthetic customer for this Vapi call only.
+
+    This is intentionally a small demo challenge, not a production identity
+    proof. The number is taken only from authenticated Vapi call context and
+    the customer/call association already stored by the backend.
+    """
+    requested_customer = arguments.get("customer_id")
+    if not isinstance(requested_customer, str) or not requested_customer.startswith("DEMO-"):
+        raise ToolFailure("এই verification শুধুমাত্র synthetic demo customer-এর জন্য।")
+    if arguments.get("verification_method") != "registered_phone_last4":
+        raise ToolFailure("শুধু registered_phone_last4 demo verification সমর্থিত।")
+    provided_last4 = normalize_demo_last4(arguments.get("provided_last4"))
+    if provided_last4 is None:
+        raise ToolFailure("চারটি বৈধ বাংলা বা ইংরেজি digit প্রয়োজন।")
+
+    trusted_phone, from_trusted_context = _candidate_phone(call, {})
+    if not from_trusted_context:
+        raise ToolFailure("এই verification-এর জন্য trusted Vapi caller number প্রয়োজন।")
+
+    call_rows = await _supabase_get(
+        "call_logs",
+        {
+            "select": "id,customer_id,phone_number,identity_verified,ended_at,structured_output",
+            "vapi_call_id": f"eq.{call_id}",
+            "limit": "2",
+        },
+    )
+    if len(call_rows) != 1:
+        raise ToolFailure("এই call-এর trusted customer association পাওয়া যায়নি।")
+    call_log = call_rows[0]
+    if (
+        call_log.get("ended_at") is not None
+        or call_log.get("customer_id") != requested_customer
+        or normalize_bangladesh_phone(call_log.get("phone_number")) != trusted_phone
+    ):
+        raise ToolFailure("এই call-এর trusted customer association মেলেনি।")
+
+    customers = await _supabase_get(
+        "customers",
+        {
+            "select": "customer_id,registered_phone,account_status",
+            "customer_id": f"eq.{requested_customer}",
+            "limit": "2",
+        },
+    )
+    if len(customers) != 1:
+        raise ToolFailure("Synthetic demo customer নিরাপদভাবে যাচাই করা যায়নি।")
+    customer = customers[0]
+    registered_phone = normalize_bangladesh_phone(customer.get("registered_phone"))
+    if customer.get("account_status") != "demo" or registered_phone != trusted_phone:
+        raise ToolFailure("Synthetic demo customer নিরাপদভাবে যাচাই করা যায়নি।")
+
+    verification_rows = await _supabase_get(
+        "call_identity_verifications",
+        {
+            "select": "id,verified,verified_at",
+            "call_log_id": f"eq.{call_log['id']}",
+            "customer_id": f"eq.{requested_customer}",
+            "limit": "2",
+        },
+    )
+    if len(verification_rows) > 1:
+        raise DatabaseUnavailable
+    if (
+        call_log.get("identity_verified") is True
+        and len(verification_rows) == 1
+        and verification_rows[0].get("verified") is True
+        and verification_rows[0].get("verified_at") is not None
+    ):
+        return json.dumps(
+            {
+                "success": True,
+                "customer_id": requested_customer,
+                "identity_verified": True,
+                "verification_method": "registered_phone_last4",
+                "already_verified": True,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    structured = call_log.get("structured_output")
+    structured = dict(structured) if isinstance(structured, dict) else {}
+    attempts = _demo_attempt_count(structured)
+    if attempts >= 2:
+        raise ToolFailure("Demo verification-এর দুইটি চেষ্টা ইতিমধ্যে শেষ হয়েছে।")
+
+    expected_last4 = registered_phone[-4:]
+    next_attempt = attempts + 1
+    structured["demo_identity_attempts"] = next_attempt
+    structured["demo_identity_last_attempt_at"] = datetime.now(timezone.utc).isoformat()
+    if not hmac.compare_digest(provided_last4, expected_last4):
+        written = await _supabase_write(
+            "PATCH",
+            "call_logs",
+            params={"id": f"eq.{call_log['id']}"},
+            payload={"structured_output": structured},
+        )
+        if len(written) != 1:
+            raise DatabaseUnavailable
+        return json.dumps(
+            {
+                "success": False,
+                "customer_id": requested_customer,
+                "identity_verified": False,
+                "verification_method": "registered_phone_last4",
+                "attempts_remaining": 2 - next_attempt,
+            },
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+
+    written_calls = await _supabase_write(
+        "PATCH",
+        "call_logs",
+        params={"id": f"eq.{call_log['id']}"},
+        payload={"identity_verified": True, "structured_output": structured},
+    )
+    if len(written_calls) != 1:
+        raise DatabaseUnavailable
+    verification_written = await _supabase_write(
+        "POST",
+        "call_identity_verifications",
+        params={"on_conflict": "call_log_id,customer_id"},
+        payload={
+            "call_log_id": call_log["id"],
+            "customer_id": requested_customer,
+            "verification_method": "registered_phone_last4",
+            "verified": True,
+            "verified_at": datetime.now(timezone.utc).isoformat(),
+            "failure_reason": None,
+        },
+        prefer="resolution=merge-duplicates,return=representation",
+    )
+    if len(verification_written) != 1:
+        raise DatabaseUnavailable
+    logger.info("operation=demo_identity_verification category=verified")
+    return json.dumps(
+        {
+            "success": True,
+            "customer_id": requested_customer,
+            "identity_verified": True,
+            "verification_method": "registered_phone_last4",
+            "attempts_remaining": 2 - next_attempt,
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+
 async def get_payment_status(call_id: str, arguments: dict[str, Any]) -> str:
     """Return a payment record only for the verified customer bound to a call."""
     call_rows = await _supabase_get(
@@ -537,6 +714,8 @@ async def _execute_tool(
         name, arguments = _tool_arguments(tool_call)
         if name == "get_customer_profile":
             result = await get_customer_profile(call_id, call, arguments)
+        elif name == "verify_demo_identity":
+            result = await verify_demo_identity(call_id, call, arguments)
         elif name == "get_payment_status":
             result = await get_payment_status(call_id, arguments)
         elif name == "create_support_ticket":
