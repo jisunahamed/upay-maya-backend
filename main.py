@@ -21,7 +21,7 @@ logger = logging.getLogger(__name__)
 app = FastAPI(
     title="Maya Demo Backend",
     description="Railway bootstrap with Supabase connectivity check only.",
-    version="0.2.1",
+    version="0.2.2",
 )
 
 
