@@ -375,6 +375,39 @@ class VapiToolTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("outstanding_amount", json.loads(results[0]["result"]))
         self.assertIn("error", results[1])
 
+    async def test_support_ticket_remains_inactive_without_persistence(self):
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True):
+            response = await self.post(
+                self.payload({"issue": "synthetic"}, tool_name="create_support_ticket")
+            )
+        item = response.json()["results"][0]
+        self.assertIn("error", item)
+        self.assertNotIn("success", json.dumps(item).lower())
+
+    async def test_callback_rejects_past_date_before_inactive_workflow(self):
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True):
+            response = await self.post(
+                self.payload(
+                    {"callback_at": "2020-01-01T10:00:00+06:00"},
+                    tool_name="schedule_callback",
+                )
+            )
+        item = response.json()["results"][0]
+        self.assertIn("error", item)
+        self.assertIn("অতীত", item["error"])
+
+    async def test_future_callback_stays_inactive_without_worker(self):
+        with patch.dict(os.environ, {"VAPI_WEBHOOK_SECRET": WEBHOOK_SECRET}, clear=True):
+            response = await self.post(
+                self.payload(
+                    {"callback_at": "2035-01-01T10:00:00+06:00"},
+                    tool_name="schedule_callback",
+                )
+            )
+        item = response.json()["results"][0]
+        self.assertIn("error", item)
+        self.assertIn("worker", item["error"])
+
     async def test_demo_operator_endpoint_is_disabled_by_default(self):
         with patch.dict(os.environ, {}, clear=True):
             response = await self.operator_post(

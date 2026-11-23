@@ -11,7 +11,7 @@ import json
 import logging
 import os
 import re
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import httpx
@@ -497,6 +497,36 @@ async def get_payment_status(call_id: str, arguments: dict[str, Any]) -> str:
     return json.dumps(result, ensure_ascii=False, separators=(",", ":"), default=str)
 
 
+def _inactive_support_ticket(_arguments: dict[str, Any]) -> str:
+    raise ToolFailure(
+        "Support ticket storage ও authorized assignment workflow সক্রিয় না হওয়ায় ticket তৈরি করা যায়নি।"
+    )
+
+
+def _inactive_schedule_callback(arguments: dict[str, Any]) -> str:
+    raw = next(
+        (
+            arguments.get(key)
+            for key in ("callback_at", "scheduled_at", "date_time", "datetime")
+            if arguments.get(key) is not None
+        ),
+        None,
+    )
+    if not isinstance(raw, str):
+        raise ToolFailure("Callback-এর জন্য timezone-সহ ভবিষ্যৎ সময় প্রয়োজন।")
+    try:
+        scheduled = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+    except ValueError as exc:
+        raise ToolFailure("Callback সময়টি বৈধ ISO 8601 format নয়।") from exc
+    if scheduled.tzinfo is None:
+        raise ToolFailure("Callback সময়ে timezone থাকা আবশ্যক।")
+    if scheduled.astimezone(timezone.utc) <= datetime.now(timezone.utc) + timedelta(minutes=1):
+        raise ToolFailure("অতীত বা তাৎক্ষণিক সময়ে callback schedule করা যাবে না।")
+    raise ToolFailure(
+        "Callback persistence, consent re-check ও worker সক্রিয় না হওয়ায় callback তৈরি করা যায়নি।"
+    )
+
+
 async def _execute_tool(
     call_id: str,
     call: dict[str, Any],
@@ -509,6 +539,10 @@ async def _execute_tool(
             result = await get_customer_profile(call_id, call, arguments)
         elif name == "get_payment_status":
             result = await get_payment_status(call_id, arguments)
+        elif name == "create_support_ticket":
+            result = _inactive_support_ticket(arguments)
+        elif name == "schedule_callback":
+            result = _inactive_schedule_callback(arguments)
         else:
             raise ToolFailure("এই tool-টি বর্তমানে backend-এ সক্রিয় নয়।")
         logger.info("operation=vapi_tool tool=%s category=success", name)

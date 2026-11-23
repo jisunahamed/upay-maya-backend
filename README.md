@@ -2,7 +2,8 @@
 
 This is a synthetic-data demonstration backend. It provides health checks and
 an authenticated Vapi Function Tool endpoint for a verification-gated payment
-status lookup. It does not initiate calls or perform financial transactions.
+status lookup and a disabled-by-default, admin-only outbound call endpoint. It
+does not initiate calls automatically or perform financial transactions.
 
 ## Run locally
 
@@ -19,6 +20,14 @@ Open `http://127.0.0.1:8000/health` to confirm `{"status":"ok"}`.
 - `SUPABASE_SECRET_KEY`: Backend-only `sb_secret_` key.
 - `VAPI_WEBHOOK_SECRET`: Random value of at least 32 characters, configured as
   a Vapi Bearer credential for `POST /vapi/tools`.
+- `ENABLE_OUTBOUND_CALLS`: Fail-closed switch for the admin-only outbound
+  endpoint. Keep `false` until an authorized synthetic test.
+- `OUTBOUND_ADMIN_SECRET`: Separate Bearer secret for
+  `POST /operator/demo/outbound-calls`; never reuse the webhook secret.
+- `VAPI_PRIVATE_API_KEY`: Backend-only Vapi private API key. Never expose it
+  to a browser, assistant prompt, tool argument, log, or repository.
+- `VAPI_ASSISTANT_ID`: Must remain Maya's saved assistant ID.
+- `VAPI_PHONE_NUMBER_ID`: Vapi ID for the existing imported Twilio number.
 - `ENABLE_DEMO_OPERATOR_VERIFICATION`: Set to `true` only while running an
   authorized synthetic-data verification test.
 - `OPERATOR_API_SECRET`: Separate random value of at least 32 characters for
@@ -68,6 +77,25 @@ Vapi's supported per-call override without changing the saved assistant:
 The backend accepts only an allowlisted reason from trusted call context. It
 does not currently initiate calls, and no amount or due date belongs in the
 initial greeting.
+
+## Consent-gated outbound initiation
+
+Run `migrations/002_outbound_call_consent.sql` before enabling outbound calls.
+It adds nullable `voice_call_consent` and `opted_out` fields without changing
+existing consent. `NULL` fails closed.
+
+`POST /operator/demo/outbound-calls` is not a Vapi tool. It accepts only a
+`DEMO-*` customer ID, reads the registered phone from Supabase, requires
+`contact_consent=true`, `voice_call_consent=true`, and `opted_out=false`, then
+uses Vapi `POST /call` with Maya v6 and a per-call outbound greeting override.
+It remains unavailable unless `ENABLE_OUTBOUND_CALLS=true` and all private
+server configuration is valid.
+
+The outbound endpoint must be invoked only after a separate explicit approval.
+Do not call it from Composer, the assistant, a public client, or automated test.
+If Vapi accepts a call but the subsequent audit association fails, the endpoint
+returns `association_status=failed_do_not_retry`; never retry that response,
+because the first call may already be queued.
 
 ## Call history webhook
 
